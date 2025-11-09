@@ -1,14 +1,16 @@
 import express from 'express';
 import multer from 'multer';
-import pako from 'pako';
-import { createCanvas, loadImage } from 'canvas';
 import compression from 'compression';
 import helmet from 'helmet';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
+import { getRenderer } from './rlottie-renderer.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Initialize renderer
+const renderer = getRenderer();
 
 // Middleware
 app.use(helmet());
@@ -16,103 +18,45 @@ app.use(cors());
 app.use(compression());
 app.use(express.json({ limit: '50mb' }));
 
-// Rate limiting - adjust based on your needs
+// Rate limiting
 const limiter = rateLimit({
-  windowMs: 1000, // 1 second
-  max: 10000, // 10000 requests per second per IP
+  windowMs: 1000,
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '10000'),
   standardHeaders: true,
   legacyHeaders: false,
+  message: { error: 'Too many requests' }
 });
 
 app.use(limiter);
 
-// Multer configuration for file uploads
+// Multer configuration
 const storage = multer.memoryStorage();
 const upload = multer({ 
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  limits: { 
+    fileSize: parseInt(process.env.MAX_FILE_SIZE || '10485760'),
+    files: 100
+  },
   fileFilter: (req, file, cb) => {
-    if (!file.originalname.endsWith('.tgs')) {
+    if (!file.originalname.toLowerCase().endsWith('.tgs')) {
       return cb(new Error('Only .tgs files are allowed'));
     }
     cb(null, true);
   }
 });
 
-// Lottie renderer using canvas
-class LottieRenderer {
-  static async renderFrame(animationData, frameNumber = 0, width = 512, height = 512) {
-    const canvas = createCanvas(width, height);
-    const ctx = canvas.getContext('2d');
-    
-    // Clear canvas
-    ctx.clearRect(0, 0, width, height);
-    
-    // Simple Lottie rendering - this is a simplified version
-    // For production, you'd want a full Lottie renderer
-    try {
-      // Set background if specified
-      if (animationData.bg) {
-        ctx.fillStyle = animationData.bg;
-        ctx.fillRect(0, 0, width, height);
-      }
-      
-      // This is a simplified renderer - in production you'd need
-      // a full Lottie implementation or use rlottie bindings
-      // For now, we'll return a canvas with basic rendering
-      
-      return canvas;
-    } catch (error) {
-      throw new Error(`Rendering failed: ${error.message}`);
-    }
-  }
-}
-
-// Convert TGS to PNG
-async function convertTgsToPng(buffer, frameNumber = 0) {
-  try {
-    // Decompress gzip
-    const decompressed = pako.ungzip(buffer, { to: 'string' });
-    
-    // Parse JSON
-    const animationData = JSON.parse(decompressed);
-    
-    // Get dimensions
-    const width = animationData.w || 512;
-    const height = animationData.h || 512;
-    const totalFrames = animationData.op || 60; // op = out point (last frame)
-    
-    // Validate frame number
-    if (frameNumber >= totalFrames) {
-      frameNumber = 0;
-    }
-    
-    // Render frame
-    const canvas = await LottieRenderer.renderFrame(animationData, frameNumber, width, height);
-    
-    // Convert to PNG buffer
-    return {
-      buffer: canvas.toBuffer('image/png'),
-      width,
-      height,
-      totalFrames
-    };
-  } catch (error) {
-    throw new Error(`Conversion failed: ${error.message}`);
-  }
-}
-
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     uptime: process.uptime(),
     memory: process.memoryUsage(),
+    pid: process.pid,
     timestamp: new Date().toISOString()
   });
 });
 
-// Single file conversion endpoint
+// Single file conversion
 app.post('/convert', upload.single('file'), async (req, res) => {
   const startTime = Date.now();
   
@@ -121,17 +65,24 @@ app.post('/convert', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
-    const frameNumber = parseInt(req.query.frame || '0');
-    const format = req.query.format || 'png'; // Future: support webp
+    const options = {
+      frame: parseInt(req.query.frame || '0'),
+      width: parseInt(req.query.width || '0') || undefined,
+      height: parseInt(req.query.height || '0') || undefined,
+      format: req.query.format || 'png',
+      quality: parseInt(req.query.quality || '90')
+    };
+
+    const result = await renderer.render(req.file.buffer, options);
     
-    const result = await convertTgsToPng(req.file.buffer, frameNumber);
-    
-    // Set headers
     res.set({
-      'Content-Type': 'image/png',
+      'Content-Type': `image/${result.format}`,
       'Content-Length': result.buffer.length,
       'X-Total-Frames': result.totalFrames,
-      'X-Processing-Time': `${Date.now() - startTime}ms`
+      'X-Width': result.width,
+      'X-Height': result.height,
+      'X-Processing-Time': `${Date.now() - startTime}ms`,
+      'X-Format': result.format
     });
     
     res.send(result.buffer);
@@ -139,12 +90,13 @@ app.post('/convert', upload.single('file'), async (req, res) => {
     console.error('Conversion error:', error);
     res.status(500).json({ 
       error: 'Conversion failed',
-      message: error.message 
+      message: error.message,
+      processingTime: `${Date.now() - startTime}ms`
     });
   }
 });
 
-// Batch conversion endpoint
+// Batch conversion
 app.post('/convert/batch', upload.array('files', 100), async (req, res) => {
   const startTime = Date.now();
   
@@ -153,22 +105,35 @@ app.post('/convert/batch', upload.array('files', 100), async (req, res) => {
       return res.status(400).json({ error: 'No files uploaded' });
     }
     
-    const frameNumber = parseInt(req.query.frame || '0');
+    const options = {
+      frame: parseInt(req.query.frame || '0'),
+      width: parseInt(req.query.width || '0') || undefined,
+      height: parseInt(req.query.height || '0') || undefined,
+      format: req.query.format || 'png',
+      quality: parseInt(req.query.quality || '90')
+    };
+
+    // Process files in parallel with concurrency limit
+    const CONCURRENCY = parseInt(process.env.BATCH_CONCURRENCY || '10');
+    const results = [];
     
-    // Process all files in parallel
-    const results = await Promise.allSettled(
-      req.files.map(file => convertTgsToPng(file.buffer, frameNumber))
-    );
+    for (let i = 0; i < req.files.length; i += CONCURRENCY) {
+      const batch = req.files.slice(i, i + CONCURRENCY);
+      const batchResults = await Promise.allSettled(
+        batch.map(file => renderer.render(file.buffer, options))
+      );
+      results.push(...batchResults);
+    }
     
     const successful = results.filter(r => r.status === 'fulfilled').length;
     const failed = results.length - successful;
     
-    // Return results as JSON with base64 images
     const response = {
       total: req.files.length,
       successful,
       failed,
       processingTime: `${Date.now() - startTime}ms`,
+      avgTimePerFile: `${((Date.now() - startTime) / req.files.length).toFixed(2)}ms`,
       images: results.map((result, index) => ({
         filename: req.files[index].originalname,
         status: result.status,
@@ -178,9 +143,11 @@ app.post('/convert/batch', upload.array('files', 100), async (req, res) => {
         error: result.status === 'rejected' 
           ? result.reason.message 
           : null,
-        totalFrames: result.status === 'fulfilled' 
-          ? result.value.totalFrames 
-          : null
+        width: result.status === 'fulfilled' ? result.value.width : null,
+        height: result.status === 'fulfilled' ? result.value.height : null,
+        totalFrames: result.status === 'fulfilled' ? result.value.totalFrames : null,
+        format: result.status === 'fulfilled' ? result.value.format : null,
+        size: result.status === 'fulfilled' ? result.value.buffer.length : null
       }))
     };
     
@@ -189,29 +156,33 @@ app.post('/convert/batch', upload.array('files', 100), async (req, res) => {
     console.error('Batch conversion error:', error);
     res.status(500).json({ 
       error: 'Batch conversion failed',
-      message: error.message 
+      message: error.message,
+      processingTime: `${Date.now() - startTime}ms`
     });
   }
 });
 
-// Get animation info without conversion
+// Get animation info
 app.post('/info', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
-    const decompressed = pako.ungzip(req.file.buffer, { to: 'string' });
-    const animationData = JSON.parse(decompressed);
+    const animationData = await renderer.parseTgs(req.file.buffer);
     
     res.json({
       width: animationData.w || 512,
       height: animationData.h || 512,
-      totalFrames: animationData.op || 60,
+      totalFrames: (animationData.op || 60) - (animationData.ip || 0),
+      inPoint: animationData.ip || 0,
+      outPoint: animationData.op || 60,
       frameRate: animationData.fr || 30,
-      duration: (animationData.op || 60) / (animationData.fr || 30),
+      duration: ((animationData.op || 60) - (animationData.ip || 0)) / (animationData.fr || 30),
       layers: animationData.layers?.length || 0,
-      assets: animationData.assets?.length || 0
+      assets: animationData.assets?.length || 0,
+      version: animationData.v,
+      name: animationData.nm || 'untitled'
     });
   } catch (error) {
     console.error('Info extraction error:', error);
@@ -222,64 +193,154 @@ app.post('/info', upload.single('file'), async (req, res) => {
   }
 });
 
-// Base64 conversion endpoint (no file upload needed)
-app.post('/convert/base64', express.json({ limit: '50mb' }), async (req, res) => {
+// Base64 conversion
+app.post('/convert/base64', async (req, res) => {
   const startTime = Date.now();
   
   try {
-    const { data, frame = 0 } = req.body;
+    const { data, frame = 0, width, height, format = 'png', quality = 90 } = req.body;
     
     if (!data) {
       return res.status(400).json({ error: 'No data provided' });
     }
     
-    // Decode base64
     const buffer = Buffer.from(data, 'base64');
     
-    const result = await convertTgsToPng(buffer, frame);
+    const options = {
+      frame: parseInt(frame),
+      width: width ? parseInt(width) : undefined,
+      height: height ? parseInt(height) : undefined,
+      format,
+      quality: parseInt(quality)
+    };
+
+    const result = await renderer.render(buffer, options);
     
     res.json({
       image: result.buffer.toString('base64'),
       width: result.width,
       height: result.height,
       totalFrames: result.totalFrames,
+      format: result.format,
+      size: result.buffer.length,
       processingTime: `${Date.now() - startTime}ms`
     });
   } catch (error) {
     console.error('Base64 conversion error:', error);
     res.status(500).json({ 
       error: 'Conversion failed',
+      message: error.message,
+      processingTime: `${Date.now() - startTime}ms`
+    });
+  }
+});
+
+// Bulk info extraction
+app.post('/info/batch', upload.array('files', 100), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'No files uploaded' });
+    }
+
+    const results = await Promise.allSettled(
+      req.files.map(async file => {
+        const animationData = await renderer.parseTgs(file.buffer);
+        return {
+          filename: file.originalname,
+          width: animationData.w || 512,
+          height: animationData.h || 512,
+          totalFrames: (animationData.op || 60) - (animationData.ip || 0),
+          frameRate: animationData.fr || 30,
+          duration: ((animationData.op || 60) - (animationData.ip || 0)) / (animationData.fr || 30)
+        };
+      })
+    );
+
+    res.json({
+      total: req.files.length,
+      successful: results.filter(r => r.status === 'fulfilled').length,
+      files: results.map(r => r.status === 'fulfilled' ? r.value : { error: r.reason.message })
+    });
+  } catch (error) {
+    console.error('Bulk info error:', error);
+    res.status(500).json({ 
+      error: 'Failed to extract info',
       message: error.message 
     });
   }
 });
 
-// Error handling middleware
+// Error handling
 app.use((error, req, res, next) => {
   console.error('Global error:', error);
+  
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ 
+        error: 'File too large',
+        message: `Maximum file size is ${process.env.MAX_FILE_SIZE || '10MB'}`
+      });
+    }
+    if (error.code === 'LIMIT_FILE_COUNT') {
+      return res.status(400).json({ 
+        error: 'Too many files',
+        message: 'Maximum 100 files per batch'
+      });
+    }
+  }
+  
   res.status(500).json({ 
     error: 'Internal server error',
     message: error.message 
   });
 });
 
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ 
+    error: 'Not found',
+    message: `Endpoint ${req.method} ${req.path} does not exist`
+  });
+});
+
 // Start server
 const server = app.listen(PORT, () => {
-  console.log(`🚀 TGS Converter API running on port ${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/health`);
-  console.log(`🔄 Single conversion: POST http://localhost:${PORT}/convert`);
-  console.log(`📦 Batch conversion: POST http://localhost:${PORT}/convert/batch`);
-  console.log(`ℹ️  File info: POST http://localhost:${PORT}/info`);
-  console.log(`📝 Base64 conversion: POST http://localhost:${PORT}/convert/base64`);
+  console.log(`\n🚀 TGS Converter API v2.0`);
+  console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+  console.log(`📡 Server running on port ${PORT}`);
+  console.log(`💻 Process ID: ${process.pid}`);
+  console.log(`🔥 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`\n📋 Available endpoints:`);
+  console.log(`  GET  /health              - Health check`);
+  console.log(`  POST /convert             - Single file conversion`);
+  console.log(`  POST /convert/batch       - Batch conversion`);
+  console.log(`  POST /convert/base64      - Base64 conversion`);
+  console.log(`  POST /info                - File information`);
+  console.log(`  POST /info/batch          - Batch info extraction`);
+  console.log(`\n⚙️  Query parameters:`);
+  console.log(`  ?frame=N        - Frame number (default: 0)`);
+  console.log(`  ?width=N        - Output width (default: original)`);
+  console.log(`  ?height=N       - Output height (default: original)`);
+  console.log(`  ?format=png|webp - Output format (default: png)`);
+  console.log(`  ?quality=1-100  - Quality for WebP (default: 90)`);
+  console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, closing server...');
+const shutdown = () => {
+  console.log('\n🛑 Received shutdown signal, closing server...');
   server.close(() => {
-    console.log('Server closed');
+    console.log('✅ Server closed');
     process.exit(0);
   });
-});
+  
+  setTimeout(() => {
+    console.error('⚠️  Forced shutdown after timeout');
+    process.exit(1);
+  }, 10000);
+};
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 export default app;
