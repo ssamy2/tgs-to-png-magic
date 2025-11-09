@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
+    "cluster": "node cluster.js",
     "benchmark": "node benchmark.js",
     "test": "node test.js"
   },
