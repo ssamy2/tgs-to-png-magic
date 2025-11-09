@@ -54,6 +54,7 @@ fastify.get('/health', async (request, reply) => {
     memory: process.memoryUsage(),
     cache: cacheStats,
     renderPool: poolStats,
+    rlottie: poolStats.rlottieStatus || { available: false, mode: 'unknown' },
     timestamp: new Date().toISOString()
   };
 });

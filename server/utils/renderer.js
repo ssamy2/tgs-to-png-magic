@@ -25,6 +25,9 @@ export class RenderPool {
     this.failedTasks = 0;
     this.totalLatency = 0;
     
+    // rlottie status
+    this.rlottieStatus = { available: false, command: null, mode: 'checking' };
+    
     this.initialize();
   }
 
@@ -55,6 +58,13 @@ export class RenderPool {
     };
 
     worker.on('message', (result) => {
+      // Handle rlottie status message
+      if (result.type === 'rlottie-status') {
+        this.rlottieStatus = result.status;
+        console.log(`[Pool] rlottie status from worker ${id}:`, result.status.mode);
+        return;
+      }
+      
       this.handleWorkerMessage(workerContext, result);
     });
 
@@ -190,6 +200,7 @@ export class RenderPool {
       completedTasks: this.completedTasks,
       failedTasks: this.failedTasks,
       avgLatency: `${avgLatency}ms`,
+      rlottieStatus: this.rlottieStatus,
       workerStats: this.workers.map(w => ({
         id: w.id,
         busy: w.busy,

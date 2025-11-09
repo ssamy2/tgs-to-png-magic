@@ -58,6 +58,17 @@ async function initialize() {
     console.log(`[Worker ${workerId}] Install rlottie for 4x+ performance boost: see QUICK_START.md`);
   }
   
+  // Send rlottie status to parent
+  parentPort.postMessage({
+    type: 'rlottie-status',
+    status: {
+      available: hasRLottie,
+      command: rlottieCommand,
+      mode: hasRLottie ? 'native' : 'fallback',
+      expectedLatency: hasRLottie ? '5-12ms' : '20-50ms'
+    }
+  });
+  
   // Pre-warm sharp
   await sharp({
     create: {
