@@ -1,19 +1,21 @@
 /**
  * High-performance TGS converter API using Fastify
- * Optimized for <10ms latency and high throughput
+ * Production-ready with 2MB limit, validation, and optimized performance
  */
 
 import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
 import cors from '@fastify/cors';
-import pako from 'pako';
-import crypto from 'crypto';
-import { AnimationCache } from './cache.js';
-import { RenderPool } from './renderer.js';
+import { cpus } from 'os';
+import { AnimationCache } from './utils/cache.js';
+import { RenderPool } from './utils/renderer.js';
+import { parseTgs, generateSlug, getMetadata } from './utils/tgsParser.js';
+import { validateFileSize, validateFormat, validateFrameNumber, validateDimensions } from './utils/validators.js';
 
 const PORT = process.env.PORT || 3000;
 const CACHE_SIZE = parseInt(process.env.CACHE_SIZE || '1000');
-const WORKER_POOL_SIZE = parseInt(process.env.WORKER_POOL_SIZE || '0') || require('os').cpus().length;
+const WORKER_POOL_SIZE = parseInt(process.env.WORKER_POOL_SIZE || '0') || cpus().length;
+const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
 
 // Initialize
 const cache = new AnimationCache(CACHE_SIZE);
@@ -23,7 +25,7 @@ const renderPool = new RenderPool(WORKER_POOL_SIZE);
 const fastify = Fastify({
   logger: false,
   requestTimeout: 30000,
-  bodyLimit: 10485760, // 10MB
+  bodyLimit: MAX_FILE_SIZE,
   trustProxy: true
 });
 
@@ -34,43 +36,10 @@ await fastify.register(cors, {
 
 await fastify.register(multipart, {
   limits: {
-    fileSize: 10485760,
+    fileSize: MAX_FILE_SIZE,
     files: 1
   }
 });
-
-/**
- * Parse TGS buffer
- */
-function parseTgs(buffer) {
-  try {
-    const decompressed = pako.ungzip(buffer, { to: 'string' });
-    return JSON.parse(decompressed);
-  } catch (error) {
-    throw new Error(`Invalid TGS file: ${error.message}`);
-  }
-}
-
-/**
- * Generate cache key from animation data
- */
-function generateSlug(animationData) {
-  const hash = crypto.createHash('sha256');
-  hash.update(JSON.stringify(animationData));
-  return hash.digest('hex').substring(0, 16);
-}
-
-/**
- * Get animation metadata
- */
-function getMetadata(animationData) {
-  return {
-    width: animationData.w || 512,
-    height: animationData.h || 512,
-    totalFrames: (animationData.op || 60) - (animationData.ip || 0),
-    frameRate: animationData.fr || 30
-  };
-}
 
 /**
  * Health check endpoint
@@ -105,12 +74,12 @@ fastify.post('/convert', async (request, reply) => {
     // Read file buffer
     const buffer = await data.toBuffer();
     
+    // Validate file size
+    validateFileSize(buffer.length);
+    
     // Parse TGS
     const animationData = parseTgs(buffer);
     const metadata = getMetadata(animationData);
-    
-    // Generate slug for caching
-    const slug = generateSlug(animationData);
     
     // Get options from query
     const frameNumber = parseInt(request.query.frame || '0');
@@ -119,11 +88,18 @@ fastify.post('/convert', async (request, reply) => {
     const width = parseInt(request.query.width || '0') || metadata.width;
     const height = parseInt(request.query.height || '0') || metadata.height;
     
+    // Validate
+    validateFormat(format);
+    validateFrameNumber(frameNumber, metadata.totalFrames);
+    validateDimensions(width, height);
+    
+    // Generate slug for caching
+    const slug = generateSlug(animationData);
+    
     // Check cache
     let cachedData = cache.get(slug);
     
     if (!cachedData) {
-      // Store in cache
       cache.set(slug, animationData, metadata);
       cachedData = cache.get(slug);
     }
@@ -151,7 +127,7 @@ fastify.post('/convert', async (request, reply) => {
     
   } catch (error) {
     console.error('Conversion error:', error);
-    return reply.code(500).send({
+    return reply.code(error.message.includes('Invalid') || error.message.includes('too large') ? 400 : 500).send({
       error: 'Conversion failed',
       message: error.message,
       processingTime: `${Date.now() - startTime}ms`
@@ -175,9 +151,20 @@ fastify.post('/convert/base64', async (request, reply) => {
     // Decode base64
     const buffer = Buffer.from(data, 'base64');
     
+    // Validate
+    validateFileSize(buffer.length);
+    validateFormat(format);
+    
     // Parse TGS
     const animationData = parseTgs(buffer);
     const metadata = getMetadata(animationData);
+    
+    const frameNumber = parseInt(frame);
+    const finalWidth = width ? parseInt(width) : metadata.width;
+    const finalHeight = height ? parseInt(height) : metadata.height;
+    
+    validateFrameNumber(frameNumber, metadata.totalFrames);
+    validateDimensions(finalWidth, finalHeight);
     
     // Generate slug
     const slug = generateSlug(animationData);
@@ -193,13 +180,8 @@ fastify.post('/convert/base64', async (request, reply) => {
     // Render
     const result = await renderPool.renderFrame(
       cachedData.animationData,
-      parseInt(frame),
-      {
-        format,
-        quality: parseInt(quality),
-        width: width ? parseInt(width) : metadata.width,
-        height: height ? parseInt(height) : metadata.height
-      }
+      frameNumber,
+      { format, quality: parseInt(quality), width: finalWidth, height: finalHeight }
     );
     
     cache.release(slug);
@@ -219,7 +201,7 @@ fastify.post('/convert/base64', async (request, reply) => {
     
   } catch (error) {
     console.error('Conversion error:', error);
-    return reply.code(500).send({
+    return reply.code(error.message.includes('Invalid') || error.message.includes('too large') ? 400 : 500).send({
       error: 'Conversion failed',
       message: error.message,
       processingTime: `${Date.now() - startTime}ms`
@@ -239,6 +221,8 @@ fastify.post('/info', async (request, reply) => {
     }
 
     const buffer = await data.toBuffer();
+    validateFileSize(buffer.length);
+    
     const animationData = parseTgs(buffer);
     const metadata = getMetadata(animationData);
     
@@ -255,7 +239,7 @@ fastify.post('/info', async (request, reply) => {
     };
     
   } catch (error) {
-    return reply.code(500).send({
+    return reply.code(error.message.includes('Invalid') || error.message.includes('too large') ? 400 : 500).send({
       error: 'Failed to extract info',
       message: error.message
     });
@@ -287,12 +271,13 @@ async function start() {
   try {
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
     
-    console.log(`\n🚀 TGS Converter API v2.0 (High Performance)`);
+    console.log(`\n🚀 TGS Converter API v2.0 (Production)`);
     console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
     console.log(`📡 Server: http://0.0.0.0:${PORT}`);
     console.log(`💻 PID: ${process.pid}`);
     console.log(`🔥 Workers: ${WORKER_POOL_SIZE}`);
-    console.log(`💾 Cache size: ${CACHE_SIZE}`);
+    console.log(`💾 Cache: ${CACHE_SIZE} entries`);
+    console.log(`📦 Max upload: 2MB`);
     console.log(`\n📋 Endpoints:`);
     console.log(`  POST /convert          - Multipart file upload`);
     console.log(`  POST /convert/base64   - Base64 payload`);
@@ -300,7 +285,7 @@ async function start() {
     console.log(`  GET  /health           - Health check`);
     console.log(`  GET  /stats            - Performance stats`);
     console.log(`  POST /cache/clear      - Clear cache`);
-    console.log(`\n⚡ Performance target: <10ms per frame`);
+    console.log(`\n⚡ Target: 5-12ms (rlottie) | 20-50ms (fallback)`);
     console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
     
   } catch (error) {

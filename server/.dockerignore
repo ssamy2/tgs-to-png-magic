@@ -1,0 +1,14 @@
+node_modules
+npm-debug.log
+*.tgs
+benchmark-results-*.json
+.git
+.gitignore
+.env
+logs/*.log
+.DS_Store
+*.swp
+*.swo
+README.md
+QUICK_START.md
+INSTALL.md

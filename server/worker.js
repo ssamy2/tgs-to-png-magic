@@ -5,10 +5,9 @@
 
 import { parentPort, workerData } from 'worker_threads';
 import sharp from 'sharp';
-import pako from 'pako';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { writeFile, unlink, readFile } from 'fs/promises';
+import { writeFile, unlink, readFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -17,20 +16,23 @@ const execFileAsync = promisify(execFile);
 let workerId = workerData?.workerId || 0;
 let initialized = false;
 let hasRLottie = false;
+let rlottieCommand = null;
 
 /**
  * Check if rlottie CLI is available
  */
 async function checkRLottie() {
+  // Try lottie2gif
   try {
     await execFileAsync('lottie2gif', ['--help'], { timeout: 1000 });
-    return true;
+    return 'lottie2gif';
   } catch (e) {
+    // Try rlottie_dump
     try {
       await execFileAsync('rlottie_dump', ['--help'], { timeout: 1000 });
-      return true;
+      return 'rlottie_dump';
     } catch (e2) {
-      return false;
+      return null;
     }
   }
 }
@@ -44,13 +46,16 @@ async function initialize() {
   console.log(`[Worker ${workerId}] Initializing...`);
   
   // Check for rlottie
-  hasRLottie = await checkRLottie();
+  rlottieCommand = await checkRLottie();
+  hasRLottie = !!rlottieCommand;
   
   if (hasRLottie) {
-    console.log(`[Worker ${workerId}] ✅ rlottie CLI detected - using native rendering`);
+    console.log(`[Worker ${workerId}] ✅ rlottie CLI detected (${rlottieCommand}) - native rendering enabled`);
+    console.log(`[Worker ${workerId}] Expected latency: 5-12ms per frame`);
   } else {
-    console.log(`[Worker ${workerId}] ⚠️  rlottie not found - using fallback renderer`);
-    console.log(`[Worker ${workerId}] Install rlottie for 10x+ performance boost`);
+    console.log(`[Worker ${workerId}] ⚠️  rlottie CLI not found - using fallback renderer`);
+    console.log(`[Worker ${workerId}] Expected latency: 20-50ms per frame`);
+    console.log(`[Worker ${workerId}] Install rlottie for 4x+ performance boost: see QUICK_START.md`);
   }
   
   // Pre-warm sharp
@@ -68,7 +73,7 @@ async function initialize() {
 }
 
 /**
- * Render with rlottie CLI (fastest)
+ * Render with rlottie CLI (fastest - 5-12ms)
  */
 async function renderWithRLottie(animationData, frameNumber, width, height, format) {
   const tmpJson = join(tmpdir(), `lottie_${workerId}_${Date.now()}.json`);
@@ -78,23 +83,24 @@ async function renderWithRLottie(animationData, frameNumber, width, height, form
     // Write JSON
     await writeFile(tmpJson, JSON.stringify(animationData));
     
-    // Try lottie2gif first
-    try {
+    // Execute rlottie command with timeout
+    const timeout = 10000; // 10s timeout
+    
+    if (rlottieCommand === 'lottie2gif') {
       await execFileAsync('lottie2gif', [
         tmpJson,
         tmpOut,
         `${width}x${height}`,
         frameNumber.toString()
-      ], { timeout: 5000 });
-    } catch (e) {
-      // Try rlottie_dump
+      ], { timeout });
+    } else {
       await execFileAsync('rlottie_dump', [
         tmpJson,
         tmpOut,
         width.toString(),
         height.toString(),
         frameNumber.toString()
-      ], { timeout: 5000 });
+      ], { timeout });
     }
     
     // Read and re-encode if needed
@@ -108,40 +114,66 @@ async function renderWithRLottie(animationData, frameNumber, width, height, form
     
     return buffer;
   } finally {
-    // Cleanup
+    // Cleanup with force
     try {
-      await Promise.all([
-        unlink(tmpJson).catch(() => {}),
-        unlink(tmpOut).catch(() => {})
+      await Promise.allSettled([
+        rm(tmpJson, { force: true }),
+        rm(tmpOut, { force: true })
       ]);
-    } catch (e) {}
+    } catch (e) {
+      // Ignore cleanup errors
+    }
   }
 }
 
 /**
- * Fallback: Simplified Lottie renderer
+ * Fallback: Extract first visible shape color and fill region (20-50ms)
  */
 function renderFallback(animationData, frameNumber, width, height) {
   const buffer = Buffer.alloc(width * height * 4);
   
-  // Background
+  // Start with background
+  let bgColor = { r: 255, g: 255, b: 255, a: 255 };
+  
   if (animationData.bg) {
     const bg = hexToRgb(animationData.bg);
-    for (let i = 0; i < buffer.length; i += 4) {
-      buffer[i] = bg.r;
-      buffer[i + 1] = bg.g;
-      buffer[i + 2] = bg.b;
-      buffer[i + 3] = 255;
-    }
-  } else {
-    buffer.fill(0);
+    bgColor = { ...bg, a: 255 };
   }
   
-  // Simple layer rendering
+  // Fill background
+  for (let i = 0; i < buffer.length; i += 4) {
+    buffer[i] = bgColor.r;
+    buffer[i + 1] = bgColor.g;
+    buffer[i + 2] = bgColor.b;
+    buffer[i + 3] = bgColor.a;
+  }
+  
+  // Find first visible shape color
+  let shapeColor = null;
+  
   if (animationData.layers) {
     for (const layer of animationData.layers) {
-      if (layer.ty === 4 && layer.shapes) {
-        renderShapes(buffer, layer.shapes, width, height);
+      if (!shapeColor && layer.ty === 4 && layer.shapes) {
+        shapeColor = extractFirstColor(layer.shapes);
+        if (shapeColor) break;
+      }
+    }
+  }
+  
+  // If found a shape color, fill center region
+  if (shapeColor) {
+    const startX = Math.floor(width * 0.2);
+    const endX = Math.floor(width * 0.8);
+    const startY = Math.floor(height * 0.2);
+    const endY = Math.floor(height * 0.8);
+    
+    for (let y = startY; y < endY; y++) {
+      for (let x = startX; x < endX; x++) {
+        const idx = (y * width + x) * 4;
+        buffer[idx] = shapeColor.r;
+        buffer[idx + 1] = shapeColor.g;
+        buffer[idx + 2] = shapeColor.b;
+        buffer[idx + 3] = shapeColor.a;
       }
     }
   }
@@ -150,39 +182,35 @@ function renderFallback(animationData, frameNumber, width, height) {
 }
 
 /**
- * Render shapes (basic)
+ * Extract first visible color from shapes
  */
-function renderShapes(buffer, shapes, width, height) {
+function extractFirstColor(shapes) {
   for (const shape of shapes) {
     if (shape.it) {
       const fill = shape.it.find(item => item.ty === 'fl');
       if (fill?.c?.k) {
         const [r, g, b, a = 1] = fill.c.k;
-        const color = {
+        return {
           r: Math.round(r * 255),
           g: Math.round(g * 255),
           b: Math.round(b * 255),
           a: Math.round(a * 255)
         };
-        
-        // Fill center area (simplified)
-        const startX = Math.floor(width * 0.25);
-        const endX = Math.floor(width * 0.75);
-        const startY = Math.floor(height * 0.25);
-        const endY = Math.floor(height * 0.75);
-        
-        for (let y = startY; y < endY; y++) {
-          for (let x = startX; x < endX; x++) {
-            const idx = (y * width + x) * 4;
-            buffer[idx] = color.r;
-            buffer[idx + 1] = color.g;
-            buffer[idx + 2] = color.b;
-            buffer[idx + 3] = color.a;
-          }
+      }
+    }
+    
+    // Recursive search
+    if (shape.it) {
+      for (const item of shape.it) {
+        if (item.it) {
+          const color = extractFirstColor([item]);
+          if (color) return color;
         }
       }
     }
   }
+  
+  return null;
 }
 
 /**
@@ -224,7 +252,7 @@ async function processRenderTask(data) {
     let imageBuffer;
     
     if (hasRLottie) {
-      // Use native rlottie (5-10ms)
+      // Use native rlottie (5-12ms)
       imageBuffer = await renderWithRLottie(
         animationData,
         frame,

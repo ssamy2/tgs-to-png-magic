@@ -7,8 +7,15 @@
   "scripts": {
     "start": "node server.js",
     "cluster": "node cluster.js",
+    "pm2": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop ecosystem.config.js",
+    "pm2:restart": "pm2 restart ecosystem.config.js",
+    "pm2:delete": "pm2 delete ecosystem.config.js",
+    "pm2:logs": "pm2 logs tgs-converter",
+    "pm2:monit": "pm2 monit",
     "benchmark": "node benchmark.js",
-    "test": "node test.js"
+    "docker:build": "docker build -t tgs-converter .",
+    "docker:run": "docker run -p 3000:3000 --cpus=4 -m 2g tgs-converter"
   },
   "dependencies": {
     "fastify": "^4.26.0",

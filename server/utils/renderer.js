@@ -1,5 +1,5 @@
 /**
- * High-performance rendering engine using worker threads and rlottie-wasm
+ * High-performance rendering engine using worker threads
  * Implements thread pool for parallel frame rendering
  */
 
@@ -42,7 +42,7 @@ export class RenderPool {
    * Create a new worker thread
    */
   createWorker(id) {
-    const worker = new Worker(join(__dirname, 'worker.js'), {
+    const worker = new Worker(join(__dirname, '..', 'worker.js'), {
       workerData: { workerId: id }
     });
 
