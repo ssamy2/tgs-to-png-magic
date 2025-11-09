@@ -15,8 +15,7 @@
     "@fastify/multipart": "^8.1.0",
     "@fastify/cors": "^9.0.1",
     "pako": "^2.1.0",
-    "sharp": "^0.33.2",
-    "rlottie-wasm": "^1.0.1"
+    "sharp": "^0.33.2"
   },
   "devDependencies": {
     "autocannon": "^7.15.0"
